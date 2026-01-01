@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+
+import subprocess
+import json
+import csv
+import sys
+import os
+import re
+import argparse
+import concurrent.futures
+import threading
+from datetime import datetime
+from collections import defaultdict
+from urllib.parse import urlparse
+import ipaddress
+import dns.resolver
+import requests
+
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    END = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+class ReconEngine:
+    def __init__(self, domain, asn=None, ip_range=None, deep=False, mode='bounty', output_dir='./output', phases=None):
+        self.domain = domain
+        self.asn = asn
+        self.ip_range = ip_range
+        self.deep = deep
+        self.mode = mode
+        self.output_dir = output_dir
+        self.phases = phases or list(range(1, 9))
+        self.all_subdomains = set()
+        self.all_domains = set()
+        self.live_assets = {}
+        self.dead_assets = set()
+        self.cdn_waf = {'detected': False, 'type': []}
+        self.wildcards = set()
+        self.lock = threading.Lock()
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def run_cmd(self, cmd, shell=False, timeout=600):
+        try:
+            result = subprocess.run(cmd, shell=shell, capture_output=True, text=True, timeout=timeout)
+            return result.stdout
+        except:
+            return ""
+    
+    def log(self, msg, level='INFO'):
+        color = {
+            'INFO': Colors.BLUE,
+            'SUCCESS': Colors.GREEN,
+            'WARNING': Colors.YELLOW,
+            'ERROR': Colors.RED,
+            'HEADER': Colors.CYAN
+        }.get(level, Colors.END)
+        
+        print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {msg}{Colors.END}")
+    
+    def phase1_osint(self):
+        self.log("PHASE 1: Automated OSINT", 'HEADER')
+        
+        self.log("Running theHarvester (fast sources only)...")
+        try:
+            # Use only fast, reliable sources instead of '-b all'
+            fast_sources = "anubis,crtsh,hackertarget,otx,rapiddns,sublist3r,threatminer,urlscan"
+            self.run_cmd(f"theHarvester -d {self.domain} -b {fast_sources} -f {self.output_dir}/harvester", shell=True, timeout=120)
+        except Exception as e:
+            self.log(f"theHarvester timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log("Querying crt.sh...")
+        try:
+            r = requests.get(f"https://crt.sh/?q=%.{self.domain}&output=json", timeout=30)
+            for entry in r.json():
+                names = entry.get('name_value', '').split('\n')
+                for name in names:
+                    if name and self.domain in name:
+                        self.all_domains.add(name.strip().lower())
+        except:
+            pass
+        
+        self.log("Checking certspotter...")
+        try:
+            r = requests.get(f"https://api.certspotter.com/v1/issuances?domain={self.domain}&include_subdomains=true&expand=dns_names", timeout=30)
+            for entry in r.json():
+                for name in entry.get('dns_names', []):
+                    if self.domain in name:
+                        self.all_domains.add(name.strip().lower())
+        except:
+            pass
+        
+        self.log("Running metagoofil (limited to 20 files for speed)...")
+        try:
+            # Reduced from 50 to 20 files, only essential types, with timeout
+            self.run_cmd(f"metagoofil -d {self.domain} -t pdf,docx -l 20 -o {self.output_dir}/meta -f meta.html", shell=True, timeout=180)
+        except Exception as e:
+            self.log(f"metagoofil timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log(f"OSINT discovered {len(self.all_domains)} initial domains", 'SUCCESS')
+    
+    def phase2_footprinting(self):
+        self.log("PHASE 2: Footprinting", 'HEADER')
+        
+        self.log("Running whois...")
+        whois_out = self.run_cmd(f"whois {self.domain}", shell=True)
+        with open(f'{self.output_dir}/whois.txt', 'w') as f:
+            f.write(whois_out)
+        
+        self.log("Detecting CDN/WAF...")
+        test_urls = [f"http://{self.domain}", f"https://{self.domain}", f"https://www.{self.domain}"]
+        for url in test_urls:
+            try:
+                r = requests.get(url, timeout=10, allow_redirects=True)
+                headers = r.headers
+                
+                cdn_headers = {
+                    'cf-ray': 'Cloudflare',
+                    'x-amz-cf-id': 'CloudFront',
+                    'x-akamai-transformed': 'Akamai',
+                    'x-fastly-request-id': 'Fastly',
+                    'server': headers.get('server', '')
+                }
+                
+                for header, name in cdn_headers.items():
+                    if header in [h.lower() for h in headers.keys()] or name.lower() in headers.get('server', '').lower():
+                        self.cdn_waf['detected'] = True
+                        if name not in self.cdn_waf['type']:
+                            self.cdn_waf['type'].append(name)
+                
+                if 'cloudflare' in headers.get('server', '').lower():
+                    self.cdn_waf['detected'] = True
+                    if 'Cloudflare' not in self.cdn_waf['type']:
+                        self.cdn_waf['type'].append('Cloudflare')
+                
+                break
+            except:
+                continue
+        
+        if self.cdn_waf['detected']:
+            self.log(f"CDN/WAF detected: {', '.join(self.cdn_waf['type'])}", 'WARNING')
+        else:
+            self.log("No CDN/WAF detected", 'SUCCESS')
+    
+    def phase3_passive_recon(self):
+        self.log("PHASE 3: Passive Subdomain Enumeration", 'HEADER')
+        
+        tools = [
+            ('subfinder', ['subfinder', '-d', self.domain, '-all', '-silent'], 300),
+            ('amass', ['amass', 'enum', '-passive', '-d', self.domain, '-nocolor'], 600),
+            ('assetfinder', ['assetfinder', '--subs-only', self.domain], 180),
+            ('findomain', ['findomain', '-t', self.domain, '-q'], 180),
+            ('chaos', ['chaos', '-d', self.domain, '-silent'], 120),
+        ]
+        
+        for tool_name, cmd, timeout in tools:
+            self.log(f"Running {tool_name}...")
+            try:
+                out = self.run_cmd(cmd, timeout=timeout)
+                count = 0
+                for line in out.splitlines():
+                    if line.strip() and self.domain in line:
+                        self.all_subdomains.add(line.strip().lower())
+                        count += 1
+                self.log(f"{tool_name} found {count} subdomains", 'SUCCESS')
+            except Exception as e:
+                self.log(f"{tool_name} timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log("Running gau (with timeout)...")
+        try:
+            out = self.run_cmd(['gau', '--subs', self.domain], timeout=300)
+            count = 0
+            for line in out.splitlines():
+                try:
+                    parsed = urlparse(line)
+                    if parsed.netloc and self.domain in parsed.netloc:
+                        self.all_subdomains.add(parsed.netloc.lower())
+                        count += 1
+                except:
+                    pass
+            self.log(f"gau found {count} subdomains", 'SUCCESS')
+        except Exception as e:
+            self.log(f"gau timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log("Running waybackurls (with timeout)...")
+        try:
+            out = self.run_cmd(f"echo {self.domain} | waybackurls", shell=True, timeout=300)
+            count = 0
+            for line in out.splitlines():
+                try:
+                    parsed = urlparse(line)
+                    if parsed.netloc and self.domain in parsed.netloc:
+                        self.all_subdomains.add(parsed.netloc.lower())
+                        count += 1
+                except:
+                    pass
+            self.log(f"waybackurls found {count} subdomains", 'SUCCESS')
+        except Exception as e:
+            self.log(f"waybackurls timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log("Running hakrawler (limited depth for speed)...")
+        try:
+            out = self.run_cmd(f"echo https://{self.domain} | hakrawler -plain -subs -d 2", shell=True, timeout=180)
+            count = 0
+            for line in out.splitlines():
+                try:
+                    parsed = urlparse(line)
+                    if parsed.netloc and self.domain in parsed.netloc:
+                        self.all_subdomains.add(parsed.netloc.lower())
+                        count += 1
+                except:
+                    pass
+            self.log(f"hakrawler found {count} subdomains", 'SUCCESS')
+        except Exception as e:
+            self.log(f"hakrawler timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.log("Running katana (limited scope for speed)...")
+        try:
+            out = self.run_cmd(['katana', '-u', f"https://{self.domain}", '-jc', '-kf', 'all', '-silent', '-d', '2'], timeout=300)
+            count = 0
+            for line in out.splitlines():
+                try:
+                    parsed = urlparse(line)
+                    if parsed.netloc and self.domain in parsed.netloc:
+                        self.all_subdomains.add(parsed.netloc.lower())
+                        count += 1
+                except:
+                    pass
+            self.log(f"katana found {count} subdomains", 'SUCCESS')
+        except Exception as e:
+            self.log(f"katana timeout/error (skipping): {str(e)}", 'WARNING')
+        
+        self.all_subdomains.update(self.all_domains)
+        self.all_subdomains = {s.replace('*.', '') for s in self.all_subdomains if s}
+        
+        if self.deep:
+            self.log("Deep mode: Running shuffledns (this may take a while)...", 'WARNING')
+            try:
+                with open(f'{self.output_dir}/temp_subs.txt', 'w') as f:
+                    f.write('\n'.join(self.all_subdomains))
+                out = self.run_cmd(f"shuffledns -d {self.domain} -list {self.output_dir}/temp_subs.txt -r /usr/share/wordlists/resolvers.txt -silent", shell=True, timeout=900)
+                count = 0
+                for line in out.splitlines():
+                    if line.strip():
+                        self.all_subdomains.add(line.strip().lower())
+                        count += 1
+                self.log(f"shuffledns found {count} additional subdomains", 'SUCCESS')
+            except Exception as e:
+                self.log(f"shuffledns timeout/error: {str(e)}", 'WARNING')
+        
+        self.log(f"Total subdomains discovered: {len(self.all_subdomains)}", 'SUCCESS')
+    
+    def phase4_active_recon(self):
+        self.log("PHASE 4: Active DNS Resolution & HTTP Probing", 'HEADER')
+        
+        self.log("Running dnsx for DNS resolution...")
+        with open(f'{self.output_dir}/all_subs.txt', 'w') as f:
+            f.write('\n'.join(self.all_subdomains))
+        
+        try:
+            out = self.run_cmd(['dnsx', '-l', f'{self.output_dir}/all_subs.txt', '-a', '-aaaa', '-cname', '-resp', '-silent'], timeout=600)
+            
+            resolved = set()
+            for line in out.splitlines():
+                if line.strip():
+                    parts = line.split()
+                    if parts:
+                        resolved.add(parts[0].lower())
+            
+            self.log(f"Resolved {len(resolved)} domains", 'SUCCESS')
+        except Exception as e:
+            self.log(f"dnsx timeout/error: {str(e)}", 'WARNING')
+            resolved = self.all_subdomains  # Fallback to all subdomains
+        
+        self.log("Running httpx for live HTTP/HTTPS detection...")
+        with open(f'{self.output_dir}/resolved.txt', 'w') as f:
+            f.write('\n'.join(resolved))
+        
+        try:
+            out = self.run_cmd(['httpx', '-l', f'{self.output_dir}/resolved.txt', '-status-code', '-title', '-tech-detect', '-json', '-silent', '-threads', '50'], timeout=900)
+            
+            for line in out.splitlines():
+                if line.strip():
+                    try:
+                        data = json.loads(line)
+                        url = data.get('url', '')
+                        if url:
+                            parsed = urlparse(url)
+                            host = parsed.netloc or parsed.path
+                            self.live_assets[url] = {
+                                'host': host,
+                                'status': data.get('status_code', 0),
+                                'title': data.get('title', ''),
+                                'tech': data.get('tech', []),
+                                'content_length': data.get('content_length', 0),
+                                'webserver': data.get('webserver', ''),
+                                'priority': 'medium',
+                                'category': []
+                            }
+                    except:
+                        pass
+        except Exception as e:
+            self.log(f"httpx timeout/error: {str(e)}", 'WARNING')
+        
+        self.log("Running httprobe as backup...")
+        try:
+            out = self.run_cmd(f"cat {self.output_dir}/resolved.txt | httprobe -c 50", shell=True, timeout=400)
+            for line in out.splitlines():
+                url = line.strip()
+                if url and url not in self.live_assets:
+                    parsed = urlparse(url)
+                    host = parsed.netloc or parsed.path
+                    self.live_assets[url] = {
+                        'host': host,
+                        'status': 0,
+                        'title': '',
+                        'tech': [],
+                        'content_length': 0,
+                        'webserver': '',
+                        'priority': 'low',
+                        'category': []
+                    }
+        except Exception as e:
+            self.log(f"httprobe timeout/error: {str(e)}", 'WARNING')
+        
+        self.log(f"Live assets found: {len(self.live_assets)}", 'SUCCESS')
+    
+    def phase5_filter_assets(self):
+        self.log("PHASE 5: Filtering & Deduplication", 'HEADER')
+        
+        self.log("Detecting wildcard DNS...")
+        test_sub = f"nonexistent-{datetime.now().timestamp()}.{self.domain}"
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 5
+            resolver.lifetime = 5
+            answers = resolver.resolve(test_sub, 'A')
+            if answers:
+                self.wildcards.add(self.domain)
+                self.log(f"Wildcard DNS detected for {self.domain}", 'WARNING')
+        except:
+            pass
+        
+        filtered = {}
+        seen_hosts = set()
+        
+        for url, data in self.live_assets.items():
+            host = data['host']
+            
+            if host in seen_hosts:
+                continue
+            
+            if data['status'] in [0, 404, 403, 503] and not data['title']:
+                continue
+            
+            if 'parked' in data['title'].lower() or 'domain for sale' in data['title'].lower():
+                continue
+            
+            filtered[url] = data
+            seen_hosts.add(host)
+        
+        self.live_assets = filtered
+        self.log(f"Filtered to {len(self.live_assets)} unique live assets", 'SUCCESS')
+    
+    def phase6_asn_expansion(self):
+        if not self.asn and not self.ip_range:
+            return
+        
+        self.log("PHASE 6: ASN/IP Range Expansion", 'HEADER')
+        
+        discovered_ips = set()
+        
+        if self.asn:
+            self.log(f"Expanding ASN: {self.asn}")
+            out = self.run_cmd(['asnmap', '-a', self.asn, '-silent'])
+            for line in out.splitlines():
+                if line.strip():
+                    discovered_ips.add(line.strip())
+        
+        if self.ip_range:
+            self.log(f"Expanding IP range: {self.ip_range}")
+            out = self.run_cmd(['mapcidr', '-cidr', self.ip_range, '-silent'])
+            for line in out.splitlines():
+                if line.strip():
+                    discovered_ips.add(line.strip())
+        
+        self.log(f"Discovered {len(discovered_ips)} IPs, performing reverse DNS...")
+        
+        new_domains = set()
+        for ip in list(discovered_ips)[:500]:
+            try:
+                out = self.run_cmd(['dig', '+short', '-x', ip])
+                for line in out.splitlines():
+                    domain = line.strip().rstrip('.')
+                    if domain and self.domain in domain:
+                        new_domains.add(domain)
+            except:
+                pass
+        
+        self.log(f"Discovered {len(new_domains)} new domains from reverse DNS", 'SUCCESS')
+        self.all_subdomains.update(new_domains)
+    
+    def phase7_context_scan(self):
+        self.log("PHASE 7: Context-Aware Scanning", 'HEADER')
+        
+        if self.cdn_waf['detected'] and self.mode == 'bounty':
+            self.log("Skipping aggressive scans (CDN/WAF + bounty mode)", 'WARNING')
+            return
+        
+        targets = [data['host'] for data in self.live_assets.values()][:50]
+        
+        if self.mode == 'pentest' and not self.cdn_waf['detected']:
+            self.log("Running light nmap scan (top 100 ports only)...")
+            try:
+                with open(f'{self.output_dir}/nmap_targets.txt', 'w') as f:
+                    f.write('\n'.join(targets))
+                self.run_cmd(f"nmap -iL {self.output_dir}/nmap_targets.txt -Pn -sV --top-ports 100 --max-retries 1 -T4 -oN {self.output_dir}/nmap.txt", shell=True, timeout=1200)
+                self.log("nmap scan completed", 'SUCCESS')
+            except Exception as e:
+                self.log(f"nmap timeout/error: {str(e)}", 'WARNING')
+        
+        self.log("Running nuclei (passive templates only, fast mode)...")
+        try:
+            with open(f'{self.output_dir}/nuclei_targets.txt', 'w') as f:
+                f.write('\n'.join(self.live_assets.keys()))
+            
+            self.run_cmd(f"nuclei -l {self.output_dir}/nuclei_targets.txt -t ~/nuclei-templates/http/ -severity info,low -tags tech,dns,ssl -rate-limit 150 -c 50 -timeout 10 -o {self.output_dir}/nuclei.txt", shell=True, timeout=1200)
+            self.log("nuclei scan completed", 'SUCCESS')
+        except Exception as e:
+            self.log(f"nuclei timeout/error: {str(e)}", 'WARNING')
+    
+    def phase8_classify(self):
+        self.log("PHASE 8: Asset Classification & Prioritization", 'HEADER')
+        
+        high_priority = ['admin', 'login', 'api', 'auth', 'panel', 'upload', 'dashboard']
+        medium_priority = ['dev', 'staging', 'test', 'beta', 'uat', 'demo']
+        
+        categories = {
+            'login': ['login', 'signin', 'auth', 'sso'],
+            'admin': ['admin', 'administrator', 'panel', 'manage', 'console'],
+            'api': ['api', 'rest', 'graphql', 'v1', 'v2'],
+            'dev': ['dev', 'develop', 'development', 'stage', 'staging', 'test', 'beta'],
+            'upload': ['upload', 'file', 'media', 'cdn'],
+            'static': ['static', 'assets', 'cdn', 's3', 'storage'],
+        }
+        
+        for url, data in self.live_assets.items():
+            host = data['host'].lower()
+            
+            for cat, keywords in categories.items():
+                for kw in keywords:
+                    if kw in host:
+                        data['category'].append(cat)
+            
+            for kw in high_priority:
+                if kw in host:
+                    data['priority'] = 'high'
+                    break
+            
+            if data['priority'] != 'high':
+                for kw in medium_priority:
+                    if kw in host:
+                        data['priority'] = 'medium'
+                        break
+            
+            if data['status'] in [200, 201, 301, 302]:
+                if data['priority'] == 'low':
+                    data['priority'] = 'medium'
+        
+        self.log("Asset classification complete", 'SUCCESS')
+    
+    def generate_output(self):
+        self.log("Generating output files...", 'HEADER')
+        
+        sorted_assets = sorted(self.live_assets.items(), key=lambda x: (
+            {'high': 0, 'medium': 1, 'low': 2}.get(x[1]['priority'], 3),
+            x[0]
+        ))
+        
+        with open(f'{self.output_dir}/live_assets.txt', 'w') as f:
+            for url, _ in sorted_assets:
+                f.write(f"{url}\n")
+        
+        with open(f'{self.output_dir}/live_assets.json', 'w') as f:
+            json.dump(dict(sorted_assets), f, indent=2)
+        
+        with open(f'{self.output_dir}/live_assets.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['URL', 'Host', 'Status', 'Title', 'Priority', 'Category', 'Tech', 'Webserver'])
+            for url, data in sorted_assets:
+                writer.writerow([
+                    url,
+                    data['host'],
+                    data['status'],
+                    data['title'],
+                    data['priority'],
+                    ','.join(data['category']),
+                    ','.join(data['tech']),
+                    data['webserver']
+                ])
+        
+        high = sum(1 for _, d in sorted_assets if d['priority'] == 'high')
+        medium = sum(1 for _, d in sorted_assets if d['priority'] == 'medium')
+        low = sum(1 for _, d in sorted_assets if d['priority'] == 'low')
+        
+        summary = f"""
+{Colors.CYAN}{'='*60}
+RECONNAISSANCE SUMMARY
+{'='*60}{Colors.END}
+Target: {Colors.BOLD}{self.domain}{Colors.END}
+Mode: {Colors.BOLD}{self.mode.upper()}{Colors.END}
+Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{Colors.GREEN}DISCOVERY STATS{Colors.END}
+{'='*60}
+Total Subdomains Discovered: {len(self.all_subdomains)}
+Live Assets: {len(self.live_assets)}
+  - {Colors.RED}High Priority: {high}{Colors.END}
+  - {Colors.YELLOW}Medium Priority: {medium}{Colors.END}
+  - Low Priority: {low}
+
+{Colors.BLUE}INFRASTRUCTURE{Colors.END}
+{'='*60}
+CDN/WAF Detected: {'Yes' if self.cdn_waf['detected'] else 'No'}
+CDN/WAF Type: {', '.join(self.cdn_waf['type']) if self.cdn_waf['type'] else 'N/A'}
+Wildcard DNS: {'Yes' if self.wildcards else 'No'}
+
+{Colors.YELLOW}ASSET CATEGORIES{Colors.END}
+{'='*60}
+"""
+        
+        category_counts = defaultdict(int)
+        for _, data in sorted_assets:
+            for cat in data['category']:
+                category_counts[cat] += 1
+        
+        for cat, count in sorted(category_counts.items(), key=lambda x: x[1], reverse=True):
+            summary += f"{cat.capitalize()}: {count}\n"
+        
+        summary += f"""
+{Colors.GREEN}RECOMMENDED NEXT STEPS{Colors.END}
+{'='*60}
+1. Focus on HIGH priority assets first (login, admin, api endpoints)
+2. Review MEDIUM priority assets (dev, staging environments)
+3. {'Use caution - CDN/WAF detected' if self.cdn_waf['detected'] else 'Direct access available'}
+4. Start vulnerability testing on validated live assets
+5. Check nuclei output for quick wins
+
+{Colors.CYAN}OUTPUT FILES{Colors.END}
+{'='*60}
+- {self.output_dir}/live_assets.txt
+- {self.output_dir}/live_assets.json
+- {self.output_dir}/live_assets.csv
+- {self.output_dir}/summary.txt
+- {self.output_dir}/whois.txt
+"""
+        
+        with open(f'{self.output_dir}/summary.txt', 'w') as f:
+            f.write(summary)
+        
+        print(summary)
+    
+    def run(self):
+        self.log(f"Starting reconnaissance for: {Colors.BOLD}{self.domain}{Colors.END}", 'HEADER')
+        
+        phase_funcs = {
+            1: self.phase1_osint,
+            2: self.phase2_footprinting,
+            3: self.phase3_passive_recon,
+            4: self.phase4_active_recon,
+            5: self.phase5_filter_assets,
+            6: self.phase6_asn_expansion,
+            7: self.phase7_context_scan,
+            8: self.phase8_classify
+        }
+        
+        for phase in self.phases:
+            if phase in phase_funcs:
+                phase_funcs[phase]()
+        
+        self.generate_output()
+        self.log("Reconnaissance complete!", 'SUCCESS')
+
+
+def print_banner():
+    banner = f"""{Colors.CYAN}
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║      █████╗ ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ║
+║     ██╔══██╗██╔══██╗██║   ██║██╔══██╗████╗  ██║██╔════╝ ║
+║     ███████║██║  ██║██║   ██║███████║██╔██╗ ██║██║      ║
+║     ██╔══██║██║  ██║╚██╗ ██╔╝██╔══██║██║╚██╗██║██║      ║
+║     ██║  ██║██████╔╝ ╚████╔╝ ██║  ██║██║ ╚████║╚██████╗ ║
+║     ╚═╝  ╚═╝╚═════╝   ╚═══╝  ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ║
+║                                                           ║
+║          RECONNAISSANCE ENGINE v2.0 - INTERACTIVE        ║
+║              Advanced Subdomain & Asset Discovery        ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+{Colors.END}"""
+    print(banner)
+
+
+def get_input(prompt, default=None):
+    if default:
+        user_input = input(f"{Colors.YELLOW}{prompt} [{default}]: {Colors.END}").strip()
+        return user_input if user_input else default
+    else:
+        return input(f"{Colors.YELLOW}{prompt}: {Colors.END}").strip()
+
+
+def interactive_menu():
+    print_banner()
+    
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Welcome to Advanced Reconnaissance Engine!{Colors.END}\n")
+    print("This tool will help you perform comprehensive reconnaissance on your target.\n")
+    
+    # Target domain
+    domain = get_input("Enter target domain (e.g., example.com)")
+    while not domain:
+        print(f"{Colors.RED}Error: Domain is required!{Colors.END}")
+        domain = get_input("Enter target domain (e.g., example.com)")
+    
+    # Operation mode
+    print(f"\n{Colors.CYAN}Select Operation Mode:{Colors.END}")
+    print("  1. Bug Bounty (Passive + Safe)")
+    print("  2. Penetration Test (Active + Aggressive)")
+    mode_choice = get_input("Choose mode [1-2]", "1")
+    mode = 'bounty' if mode_choice == '1' else 'pentest'
+    
+    # Deep enumeration
+    print(f"\n{Colors.CYAN}Deep Enumeration Mode:{Colors.END}")
+    print("  Enable deep enumeration? (Slower but more thorough)")
+    deep_choice = get_input("Enable deep mode? (y/n)", "n")
+    deep = deep_choice.lower() in ['y', 'yes']
+    
+    # ASN expansion
+    print(f"\n{Colors.CYAN}ASN Expansion (Optional):{Colors.END}")
+    asn_choice = get_input("Do you have an ASN to expand? (y/n)", "n")
+    asn = None
+    if asn_choice.lower() in ['y', 'yes']:
+        asn = get_input("Enter ASN (e.g., AS12345)")
+    
+    # IP range expansion
+    print(f"\n{Colors.CYAN}IP Range Expansion (Optional):{Colors.END}")
+    ip_choice = get_input("Do you have an IP range to expand? (y/n)", "n")
+    ip_range = None
+    if ip_choice.lower() in ['y', 'yes']:
+        ip_range = get_input("Enter IP range in CIDR notation (e.g., 192.168.1.0/24)")
+    
+    # Custom output directory
+    print(f"\n{Colors.CYAN}Output Configuration:{Colors.END}")
+    output_dir = get_input("Enter output directory", f"./output/{domain.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    
+    # Phase selection
+    print(f"\n{Colors.CYAN}Phase Selection:{Colors.END}")
+    print("  1. OSINT")
+    print("  2. Footprinting")
+    print("  3. Passive Subdomain Enumeration")
+    print("  4. Active DNS Resolution & HTTP Probing")
+    print("  5. Filtering & Deduplication")
+    print("  6. ASN/IP Expansion")
+    print("  7. Context-Aware Scanning")
+    print("  8. Asset Classification")
+    phases_choice = get_input("Run all phases? (y/n)", "y")
+    
+    phases = None
+    if phases_choice.lower() not in ['y', 'yes']:
+        phase_input = get_input("Enter phases to run (comma-separated, e.g., 1,3,4)", "1,2,3,4,5,8")
+        try:
+            phases = [int(p.strip()) for p in phase_input.split(',')]
+        except:
+            print(f"{Colors.RED}Invalid input, running all phases{Colors.END}")
+            phases = None
+    
+    # Confirmation
+    print(f"\n{Colors.GREEN}{'='*60}{Colors.END}")
+    print(f"{Colors.BOLD}Configuration Summary:{Colors.END}")
+    print(f"  Target Domain: {Colors.CYAN}{domain}{Colors.END}")
+    print(f"  Mode: {Colors.CYAN}{mode.upper()}{Colors.END}")
+    print(f"  Deep Mode: {Colors.CYAN}{'Enabled' if deep else 'Disabled'}{Colors.END}")
+    print(f"  ASN: {Colors.CYAN}{asn or 'Not specified'}{Colors.END}")
+    print(f"  IP Range: {Colors.CYAN}{ip_range or 'Not specified'}{Colors.END}")
+    print(f"  Output Dir: {Colors.CYAN}{output_dir}{Colors.END}")
+    print(f"  Phases: {Colors.CYAN}{phases if phases else 'All'}{Colors.END}")
+    print(f"{Colors.GREEN}{'='*60}{Colors.END}\n")
+    
+    confirm = get_input("Start reconnaissance? (y/n)", "y")
+    if confirm.lower() not in ['y', 'yes']:
+        print(f"{Colors.RED}Reconnaissance cancelled.{Colors.END}")
+        sys.exit(0)
+    
+    print(f"\n{Colors.GREEN}Starting reconnaissance...{Colors.END}\n")
+    
+    return {
+        'domain': domain,
+        'mode': mode,
+        'deep': deep,
+        'asn': asn,
+        'ip_range': ip_range,
+        'output_dir': output_dir,
+        'phases': phases
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Advanced Reconnaissance Engine - Interactive or CLI mode',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Interactive mode:
+    python3 recon.py
+  
+  CLI mode:
+    python3 recon.py example.com --mode bounty
+    python3 recon.py example.com --mode pentest --deep --asn AS12345
+    python3 recon.py example.com --ip-range 192.168.1.0/24 --output-dir ./my_scan
+    python3 recon.py example.com --phases 1,3,4,8
+        """
+    )
+    
+    parser.add_argument('domain', nargs='?', help='Target domain')
+    parser.add_argument('--asn', help='ASN to expand')
+    parser.add_argument('--ip-range', help='IP range (CIDR notation)')
+    parser.add_argument('--deep', action='store_true', help='Enable deep enumeration mode')
+    parser.add_argument('--mode', choices=['bounty', 'pentest'], default='bounty', help='Operation mode')
+    parser.add_argument('--output-dir', help='Output directory')
+    parser.add_argument('--phases', help='Comma-separated phase numbers to run (e.g., 1,3,4,8)')
+    parser.add_argument('--interactive', '-i', action='store_true', help='Force interactive mode')
+    
+    args = parser.parse_args()
+    
+    # If no domain provided or interactive flag, use interactive mode
+    if not args.domain or args.interactive:
+        config = interactive_menu()
+    else:
+        # CLI mode
+        config = {
+            'domain': args.domain,
+            'mode': args.mode,
+            'deep': args.deep,
+            'asn': args.asn,
+            'ip_range': args.ip_range,
+            'output_dir': args.output_dir or f"./output/{args.domain.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'phases': [int(p) for p in args.phases.split(',')] if args.phases else None
+        }
+    
+    # Create and run engine
+    engine = ReconEngine(**config)
+    
+    try:
+        engine.run()
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.YELLOW}[!] Reconnaissance interrupted by user{Colors.END}")
+        print(f"{Colors.CYAN}[*] Partial results saved to: {config['output_dir']}{Colors.END}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n{Colors.RED}[!] Error occurred: {str(e)}{Colors.END}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

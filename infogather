@@ -1,0 +1,1861 @@
+#!/usr/bin/env python3
+"""
+Black-Box Intelligence & Attack-Surface Mapping Tool
+Professional-grade reconnaissance framework for Parrot OS Linux
+Author: Shivam KUmar
+Version: 1.0.0
+"""
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+# Global configuration
+CONFIG = {
+    'timeout': 30,
+    'max_workers': 10,
+    'cache_dir': '/tmp/recon_cache',
+    'report_dir': './recon_reports',
+    'user_agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+}
+
+# Tool availability cache
+TOOL_CACHE = {}
+
+# Confidence levels
+CONFIDENCE_HIGH = "High"
+CONFIDENCE_MEDIUM = "Medium"
+CONFIDENCE_LOW = "Low"
+
+
+class ReconCache:
+    """Thread-safe cache for reconnaissance data"""
+    
+    def __init__(self):
+        self.data = {
+            'target': {},
+            'infrastructure': {},
+            'network': {},
+            'technology': {},
+            'application': {},
+            'authentication': {},
+            'cloud': {},
+            'osint': {},
+            'misconfig': {},
+            'correlation': {},
+            'tool_status': {}
+        }
+        self.timestamp = datetime.now().isoformat()
+    
+    def update(self, category: str, key: str, value: Any):
+        """Update cache with new data"""
+        if category in self.data:
+            if isinstance(self.data[category], dict):
+                self.data[category][key] = value
+            elif isinstance(self.data[category], list):
+                self.data[category].append(value)
+    
+    def get(self, category: str, key: str = None) -> Any:
+        """Retrieve data from cache"""
+        if key:
+            return self.data.get(category, {}).get(key)
+        return self.data.get(category, {})
+
+
+class Finding:
+    """Structured finding with confidence scoring"""
+    
+    def __init__(self, value: str, source: str, confidence: str, 
+                 category: str, validated: bool = False, notes: str = ""):
+        self.value = value
+        self.sources = [source]
+        self.confidence = confidence
+        self.category = category
+        self.validated = validated
+        self.notes = notes
+        self.first_seen = datetime.now().isoformat()
+    
+    def add_source(self, source: str):
+        """Add additional source and increase confidence"""
+        if source not in self.sources:
+            self.sources.append(source)
+            if len(self.sources) >= 2 and self.confidence == CONFIDENCE_LOW:
+                self.confidence = CONFIDENCE_MEDIUM
+            elif len(self.sources) >= 3 and self.confidence == CONFIDENCE_MEDIUM:
+                self.confidence = CONFIDENCE_HIGH
+    
+    def to_dict(self) -> Dict:
+        return {
+            'value': self.value,
+            'sources': self.sources,
+            'confidence': self.confidence,
+            'category': self.category,
+            'validated': self.validated,
+            'notes': self.notes,
+            'first_seen': self.first_seen
+        }
+
+
+class ToolChecker:
+    """Check tool availability and cache results"""
+    
+    @staticmethod
+    def is_available(tool: str) -> bool:
+        """Check if a tool is available in PATH"""
+        if tool in TOOL_CACHE:
+            return TOOL_CACHE[tool]
+        
+        try:
+            result = subprocess.run(['which', tool], 
+                                  capture_output=True, 
+                                  timeout=5,
+                                  text=True)
+            available = result.returncode == 0
+            TOOL_CACHE[tool] = available
+            return available
+        except Exception:
+            TOOL_CACHE[tool] = False
+            return False
+    
+    @staticmethod
+    def run_command(cmd: List[str], timeout: int = 30) -> Optional[str]:
+        """Run command with timeout and error handling"""
+        try:
+            result = subprocess.run(cmd,
+                                  capture_output=True,
+                                  timeout=timeout,
+                                  text=True,
+                                  errors='ignore')
+            if result.returncode == 0:
+                return result.stdout
+            return None
+        except (subprocess.TimeoutExpired, Exception):
+            return None
+
+
+class ReconFramework:
+    """Main reconnaissance framework"""
+    
+    def __init__(self, target: str):
+        self.target = target
+        self.cache = ReconCache()
+        self.findings = defaultdict(list)
+        self._init_directories()
+        self._parse_target()
+    
+    def _init_directories(self):
+        """Initialize working directories"""
+        try:
+            Path(CONFIG['cache_dir']).mkdir(parents=True, exist_ok=True)
+            Path(CONFIG['report_dir']).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    
+    def _parse_target(self):
+        """Parse and normalize target input"""
+        target = self.target.strip()
+        
+        # Check if IP
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', target):
+            self.cache.update('target', 'type', 'ip')
+            self.cache.update('target', 'ip', target)
+            self.cache.update('target', 'primary', target)
+        # Check if ASN
+        elif target.upper().startswith('AS') or target.isdigit():
+            self.cache.update('target', 'type', 'asn')
+            self.cache.update('target', 'asn', target)
+            self.cache.update('target', 'primary', target)
+        # Check if URL/domain
+        else:
+            if not target.startswith('http'):
+                target = f'https://{target}'
+            parsed = urlparse(target)
+            domain = parsed.netloc or parsed.path
+            
+            self.cache.update('target', 'type', 'domain')
+            self.cache.update('target', 'domain', domain)
+            self.cache.update('target', 'url', target)
+            self.cache.update('target', 'primary', domain)
+    
+    def _add_finding(self, category: str, finding: Finding):
+        """Add finding with deduplication"""
+        existing = None
+        for f in self.findings[category]:
+            if f.value == finding.value:
+                existing = f
+                break
+        
+        if existing:
+            for source in finding.sources:
+                existing.add_source(source)
+            if finding.validated:
+                existing.validated = True
+        else:
+            self.findings[category].append(finding)
+    
+    def _log_tool_status(self, tool: str, status: str):
+        """Log tool execution status"""
+        if 'tools' not in self.cache.data['tool_status']:
+            self.cache.data['tool_status']['tools'] = {}
+        self.cache.data['tool_status']['tools'][tool] = status
+    
+    # ============================================================
+    # MODULE 1: PASSIVE OSINT
+    # ============================================================
+    
+    def passive_osint(self):
+        """Passive OSINT collection - zero target interaction"""
+        print("\n[*] Running Passive OSINT Module...")
+        
+        with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
+            futures = []
+            
+            futures.append(executor.submit(self._whois_lookup))
+            futures.append(executor.submit(self._certificate_transparency))
+            futures.append(executor.submit(self._harvester_emails))
+            futures.append(executor.submit(self._wayback_urls))
+            
+            for future in futures:
+                try:
+                    future.result(timeout=CONFIG['timeout'] * 2)
+                except Exception:
+                    pass
+        
+        print("[+] Passive OSINT complete")
+    
+    def _whois_lookup(self):
+        """WHOIS information gathering"""
+        if not ToolChecker.is_available('whois'):
+            self._log_tool_status('whois', 'missing')
+            return
+        
+        target = self.cache.get('target', 'primary')
+        output = ToolChecker.run_command(['whois', target], timeout=20)
+        
+        if output:
+            self._log_tool_status('whois', 'success')
+            
+            # Extract organization
+            org_match = re.search(r'(?:Org(?:anization)?|org-name):\s*(.+)', output, re.I)
+            if org_match:
+                org = org_match.group(1).strip()
+                finding = Finding(org, 'whois', CONFIDENCE_HIGH, 'organization', True)
+                self._add_finding('osint', finding)
+                self.cache.update('infrastructure', 'organization', org)
+            
+            # Extract registrar
+            reg_match = re.search(r'Registrar:\s*(.+)', output, re.I)
+            if reg_match:
+                registrar = reg_match.group(1).strip()
+                self.cache.update('osint', 'registrar', registrar)
+            
+            # Extract emails
+            emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', output)
+            for email in set(emails):
+                if not any(x in email.lower() for x in ['example.com', 'redacted', 'privacy']):
+                    finding = Finding(email, 'whois', CONFIDENCE_HIGH, 'email', True)
+                    self._add_finding('osint', finding)
+        else:
+            self._log_tool_status('whois', 'failed')
+    
+    def _certificate_transparency(self):
+        """Certificate transparency log analysis"""
+        if not ToolChecker.is_available('curl'):
+            self._log_tool_status('crt.sh', 'missing')
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        # Query crt.sh
+        cmd = ['curl', '-s', f'https://crt.sh/?q=%25.{domain}&output=json']
+        output = ToolChecker.run_command(cmd, timeout=30)
+        
+        if output:
+            try:
+                certs = json.loads(output)
+                self._log_tool_status('crt.sh', 'success')
+                
+                seen_names = set()
+                for cert in certs[:50]:  # Limit processing
+                    name = cert.get('name_value', '')
+                    for line in name.split('\n'):
+                        line = line.strip().lower()
+                        if line and '*' not in line and line not in seen_names:
+                            seen_names.add(line)
+                            if line.endswith(domain.lower()):
+                                finding = Finding(line, 'crt.sh', CONFIDENCE_MEDIUM, 
+                                                'subdomain', False, 'From CT logs')
+                                self._add_finding('infrastructure', finding)
+                
+                self.cache.update('infrastructure', 'cert_count', len(certs))
+            except Exception:
+                self._log_tool_status('crt.sh', 'failed')
+        else:
+            self._log_tool_status('crt.sh', 'failed')
+    
+    def _harvester_emails(self):
+        """Email harvesting via theHarvester"""
+        if not ToolChecker.is_available('theHarvester'):
+            self._log_tool_status('theHarvester', 'missing')
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        cmd = ['theHarvester', '-d', domain, '-b', 'all', '-l', '50']
+        output = ToolChecker.run_command(cmd, timeout=60)
+        
+        if output:
+            self._log_tool_status('theHarvester', 'success')
+            
+            # Extract emails
+            emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', output)
+            for email in set(emails):
+                if domain.lower() in email.lower():
+                    finding = Finding(email, 'theHarvester', CONFIDENCE_MEDIUM, 'email')
+                    self._add_finding('osint', finding)
+        else:
+            self._log_tool_status('theHarvester', 'failed')
+    
+    def _wayback_urls(self):
+        """Wayback Machine URL collection"""
+        if not ToolChecker.is_available('curl'):
+            self._log_tool_status('wayback', 'missing')
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        cmd = ['curl', '-s', f'http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&collapse=urlkey&limit=500']
+        output = ToolChecker.run_command(cmd, timeout=45)
+        
+        if output:
+            try:
+                data = json.loads(output)
+                self._log_tool_status('wayback', 'success')
+                
+                if len(data) > 1:  # First row is headers
+                    urls = set()
+                    for row in data[1:]:
+                        if len(row) > 2:
+                            url = row[2]
+                            urls.add(url)
+                    
+                    # Extract patterns
+                    extensions = set()
+                    params = set()
+                    
+                    for url in urls:
+                        # Extract file extensions
+                        ext_match = re.search(r'\.([a-z0-9]{2,4})(?:\?|$)', url, re.I)
+                        if ext_match:
+                            extensions.add(ext_match.group(1))
+                        
+                        # Extract parameters
+                        if '?' in url:
+                            param_str = url.split('?')[1]
+                            for param in param_str.split('&'):
+                                if '=' in param:
+                                    param_name = param.split('=')[0]
+                                    params.add(param_name)
+                    
+                    self.cache.update('application', 'historical_url_count', len(urls))
+                    self.cache.update('application', 'file_extensions', list(extensions))
+                    self.cache.update('application', 'parameters', list(params)[:50])
+                    
+                    # Store sample URLs
+                    for url in list(urls)[:20]:
+                        finding = Finding(url, 'wayback', CONFIDENCE_MEDIUM, 
+                                        'historical_url', False, 'Archived URL')
+                        self._add_finding('application', finding)
+            except Exception:
+                self._log_tool_status('wayback', 'failed')
+        else:
+            self._log_tool_status('wayback', 'failed')
+    
+    # ============================================================
+    # MODULE 2: INFRASTRUCTURE & OWNERSHIP
+    # ============================================================
+    
+    def infrastructure_intelligence(self):
+        """Infrastructure and ownership intelligence"""
+        print("\n[*] Running Infrastructure Intelligence Module...")
+        
+        with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
+            futures = []
+            
+            futures.append(executor.submit(self._dns_resolution))
+            futures.append(executor.submit(self._asn_lookup))
+            futures.append(executor.submit(self._reverse_dns))
+            futures.append(executor.submit(self._cdn_detection))
+            
+            for future in futures:
+                try:
+                    future.result(timeout=CONFIG['timeout'])
+                except Exception:
+                    pass
+        
+        print("[+] Infrastructure Intelligence complete")
+    
+    def _dns_resolution(self):
+        """DNS resolution and IP discovery"""
+        if not ToolChecker.is_available('dig'):
+            self._log_tool_status('dig', 'missing')
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        # A records
+        output = ToolChecker.run_command(['dig', '+short', 'A', domain], timeout=10)
+        if output:
+            self._log_tool_status('dig', 'success')
+            ips = [ip.strip() for ip in output.split('\n') if ip.strip() and 
+                   re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip.strip())]
+            for ip in ips:
+                finding = Finding(ip, 'DNS', CONFIDENCE_HIGH, 'ip_address', True)
+                self._add_finding('infrastructure', finding)
+                self.cache.update('infrastructure', 'primary_ip', ip)
+        else:
+            self._log_tool_status('dig', 'failed')
+    
+    def _asn_lookup(self):
+        """ASN and hosting provider lookup"""
+        if not ToolChecker.is_available('whois'):
+            return
+        
+        ip = self.cache.get('infrastructure', 'primary_ip')
+        if not ip:
+            return
+        
+        output = ToolChecker.run_command(['whois', ip], timeout=15)
+        if output:
+            # Extract ASN
+            asn_match = re.search(r'(?:origin|OriginAS):\s*(AS\d+)', output, re.I)
+            if asn_match:
+                asn = asn_match.group(1)
+                self.cache.update('infrastructure', 'asn', asn)
+                finding = Finding(asn, 'whois', CONFIDENCE_HIGH, 'asn', True)
+                self._add_finding('infrastructure', finding)
+            
+            # Extract provider name
+            provider_match = re.search(r'(?:OrgName|org-name|descr):\s*(.+)', output, re.I)
+            if provider_match:
+                provider = provider_match.group(1).strip()
+                self.cache.update('infrastructure', 'hosting_provider', provider)
+                finding = Finding(provider, 'whois', CONFIDENCE_HIGH, 'hosting_provider', True)
+                self._add_finding('infrastructure', finding)
+    
+    def _reverse_dns(self):
+        """Reverse DNS lookup"""
+        if not ToolChecker.is_available('dig'):
+            return
+        
+        ip = self.cache.get('infrastructure', 'primary_ip')
+        if not ip:
+            return
+        
+        # Reverse IP for PTR query
+        octets = ip.split('.')
+        reversed_ip = '.'.join(reversed(octets)) + '.in-addr.arpa'
+        
+        output = ToolChecker.run_command(['dig', '+short', 'PTR', reversed_ip], timeout=10)
+        if output:
+            ptr = output.strip().rstrip('.')
+            if ptr:
+                self.cache.update('infrastructure', 'ptr_record', ptr)
+                finding = Finding(ptr, 'DNS', CONFIDENCE_HIGH, 'ptr_record', True)
+                self._add_finding('infrastructure', finding)
+    
+    def _cdn_detection(self):
+        """CDN and proxy detection"""
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        cdn_indicators = {
+            'cloudflare': ['cloudflare'],
+            'akamai': ['akamai', 'akamaitechnologies'],
+            'fastly': ['fastly'],
+            'cloudfront': ['cloudfront', 'amazonaws'],
+            'incapsula': ['incapsula', 'imperva'],
+            'sucuri': ['sucuri'],
+            'stackpath': ['stackpath']
+        }
+        
+        # Check CNAME records
+        if ToolChecker.is_available('dig'):
+            output = ToolChecker.run_command(['dig', '+short', 'CNAME', domain], timeout=10)
+            if output:
+                cname = output.strip().lower()
+                for cdn, indicators in cdn_indicators.items():
+                    if any(ind in cname for ind in indicators):
+                        self.cache.update('infrastructure', 'cdn', cdn.title())
+                        self.cache.update('infrastructure', 'origin_ip_hidden', True)
+                        finding = Finding(cdn.title(), 'DNS', CONFIDENCE_HIGH, 
+                                        'cdn', True, 'Origin IP likely hidden')
+                        self._add_finding('infrastructure', finding)
+                        return
+        
+        # Check NS records for Cloudflare
+        if ToolChecker.is_available('dig'):
+            output = ToolChecker.run_command(['dig', '+short', 'NS', domain], timeout=10)
+            if output and 'cloudflare' in output.lower():
+                self.cache.update('infrastructure', 'cdn', 'Cloudflare')
+                self.cache.update('infrastructure', 'origin_ip_hidden', True)
+                finding = Finding('Cloudflare', 'DNS', CONFIDENCE_HIGH, 
+                                'cdn', True, 'Origin IP likely hidden')
+                self._add_finding('infrastructure', finding)
+    
+    # ============================================================
+    # MODULE 3: NETWORK & TRANSPORT INTELLIGENCE
+    # ============================================================
+    
+    def network_intelligence(self):
+        """Network and transport layer intelligence (safe only)"""
+        print("\n[*] Running Network Intelligence Module...")
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            
+            futures.append(executor.submit(self._tls_analysis))
+            futures.append(executor.submit(self._http_headers))
+            
+            for future in futures:
+                try:
+                    future.result(timeout=CONFIG['timeout'])
+                except Exception:
+                    pass
+        
+        print("[+] Network Intelligence complete")
+    
+    def _tls_analysis(self):
+        """TLS/SSL certificate analysis"""
+        if not ToolChecker.is_available('openssl'):
+            self._log_tool_status('openssl', 'missing')
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        cmd = ['openssl', 's_client', '-connect', f'{domain}:443', 
+               '-servername', domain, '-showcerts']
+        
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
+                                  stdout=subprocess.PIPE, 
+                                  stderr=subprocess.PIPE)
+            output, _ = proc.communicate(input=b'\n', timeout=15)
+            output = output.decode('utf-8', errors='ignore')
+            
+            if output:
+                self._log_tool_status('openssl', 'success')
+                
+                # Extract issuer
+                issuer_match = re.search(r'issuer=(.+)', output)
+                if issuer_match:
+                    issuer = issuer_match.group(1).strip()
+                    self.cache.update('network', 'tls_issuer', issuer)
+                
+                # Extract subject
+                subject_match = re.search(r'subject=(.+)', output)
+                if subject_match:
+                    subject = subject_match.group(1).strip()
+                    self.cache.update('network', 'tls_subject', subject)
+                
+                # Detect TLS version
+                if 'TLSv1.3' in output:
+                    self.cache.update('network', 'tls_version', 'TLSv1.3')
+                elif 'TLSv1.2' in output:
+                    self.cache.update('network', 'tls_version', 'TLSv1.2')
+            else:
+                self._log_tool_status('openssl', 'failed')
+        except Exception:
+            self._log_tool_status('openssl', 'failed')
+    
+    def _http_headers(self):
+        """HTTP header analysis"""
+        if not ToolChecker.is_available('curl'):
+            self._log_tool_status('curl_headers', 'missing')
+            return
+        
+        url = self.cache.get('target', 'url')
+        if not url:
+            return
+        
+        cmd = ['curl', '-I', '-s', '-L', '--max-time', '15', 
+               '-A', CONFIG['user_agent'], url]
+        output = ToolChecker.run_command(cmd, timeout=20)
+        
+        if output:
+            self._log_tool_status('curl_headers', 'success')
+            
+            headers = {}
+            for line in output.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    headers[key.strip().lower()] = value.strip()
+            
+            self.cache.update('network', 'headers', headers)
+            
+            # Extract security headers
+            security_headers = ['strict-transport-security', 'content-security-policy',
+                              'x-frame-options', 'x-content-type-options']
+            found_sec_headers = []
+            for sh in security_headers:
+                if sh in headers:
+                    found_sec_headers.append(sh)
+            
+            if found_sec_headers:
+                self.cache.update('network', 'security_headers', found_sec_headers)
+            
+            # Detect HTTP version
+            if 'HTTP/2' in output or 'HTTP/3' in output:
+                version = 'HTTP/2' if 'HTTP/2' in output else 'HTTP/3'
+                self.cache.update('network', 'http_version', version)
+        else:
+            self._log_tool_status('curl_headers', 'failed')
+    
+    # ============================================================
+    # MODULE 4: TECHNOLOGY STACK IDENTIFICATION
+    # ============================================================
+    
+    def technology_stack(self):
+        """Technology stack identification with validation"""
+        print("\n[*] Running Technology Stack Module...")
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            
+            futures.append(executor.submit(self._analyze_headers))
+            futures.append(executor.submit(self._whatweb_analysis))
+            futures.append(executor.submit(self._wappalyzer_analysis))
+            
+            for future in futures:
+                try:
+                    future.result(timeout=CONFIG['timeout'])
+                except Exception:
+                    pass
+        
+        self._correlate_technologies()
+        print("[+] Technology Stack complete")
+    
+    def _analyze_headers(self):
+        """Analyze HTTP headers for technology hints"""
+        headers = self.cache.get('network', 'headers')
+        if not headers:
+            return
+        
+        tech_hints = {
+            'server': ['server', 'x-powered-by'],
+            'framework': ['x-aspnet-version', 'x-drupal-cache', 'x-generator'],
+            'language': ['x-powered-by'],
+        }
+        
+        detected = {}
+        for category, header_keys in tech_hints.items():
+            for hk in header_keys:
+                if hk in headers:
+                    value = headers[hk]
+                    # Skip generic status codes
+                    if not re.match(r'^\d+$', value):
+                        detected[category] = value
+                        finding = Finding(value, 'HTTP Headers', CONFIDENCE_MEDIUM, 
+                                        category, True)
+                        self._add_finding('technology', finding)
+        
+        self.cache.update('technology', 'from_headers', detected)
+    
+    def _whatweb_analysis(self):
+        """WhatWeb technology detection"""
+        if not ToolChecker.is_available('whatweb'):
+            self._log_tool_status('whatweb', 'missing')
+            return
+        
+        url = self.cache.get('target', 'url')
+        if not url:
+            return
+        
+        cmd = ['whatweb', '-a', '3', '--quiet', '--no-errors', url]
+        output = ToolChecker.run_command(cmd, timeout=30)
+        
+        if output:
+            self._log_tool_status('whatweb', 'success')
+            
+            # Parse WhatWeb output
+            technologies = []
+            for line in output.split('\n'):
+                if '[' in line and ']' in line:
+                    matches = re.findall(r'\[([^\]]+)\]', line)
+                    for match in matches:
+                        if match and not match.isdigit() and len(match) > 2:
+                            technologies.append(match)
+            
+            for tech in set(technologies):
+                finding = Finding(tech, 'WhatWeb', CONFIDENCE_MEDIUM, 'technology')
+                self._add_finding('technology', finding)
+        else:
+            self._log_tool_status('whatweb', 'failed')
+    
+    def _wappalyzer_analysis(self):
+        """Wappalyzer technology detection"""
+        if not ToolChecker.is_available('wappalyzer'):
+            self._log_tool_status('wappalyzer', 'missing')
+            return
+        
+        url = self.cache.get('target', 'url')
+        if not url:
+            return
+        
+        cmd = ['wappalyzer', url]
+        output = ToolChecker.run_command(cmd, timeout=30)
+        
+        if output:
+            self._log_tool_status('wappalyzer', 'success')
+            try:
+                data = json.loads(output)
+                if 'technologies' in data:
+                    for tech in data['technologies']:
+                        name = tech.get('name', '')
+                        if name:
+                            finding = Finding(name, 'Wappalyzer', CONFIDENCE_MEDIUM, 
+                                            'technology')
+                            self._add_finding('technology', finding)
+            except Exception:
+                pass
+        else:
+            self._log_tool_status('wappalyzer', 'failed')
+    
+    def _correlate_technologies(self):
+        """Correlate technology findings and filter by confidence"""
+        tech_findings = self.findings.get('technology', [])
+        
+        validated_tech = []
+        for finding in tech_findings:
+            if finding.confidence in [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM]:
+                if len(finding.sources) >= 2:
+                    finding.confidence = CONFIDENCE_HIGH
+                validated_tech.append(finding)
+        
+        self.cache.update('technology', 'validated', 
+                         [f.to_dict() for f in validated_tech])
+    
+    # ============================================================
+    # MODULE 5: APPLICATION SURFACE INTELLIGENCE
+    # ============================================================
+    
+    def application_surface(self):
+        """Application surface intelligence"""
+        print("\n[*] Running Application Surface Module...")
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            
+            futures.append(executor.submit(self._javascript_analysis))
+            futures.append(executor.submit(self._robots_sitemap))
+            
+            for future in futures:
+                try:
+                    future.result(timeout=CONFIG['timeout'] * 2)
+                except Exception:
+                    pass
+        
+        print("[+] Application Surface complete")
+    
+    def _javascript_analysis(self):
+        """JavaScript endpoint and API discovery"""
+        if not ToolChecker.is_available('katana'):
+            self._log_tool_status('katana', 'missing')
+            return
+        
+        url = self.cache.get('target', 'url')
+        if not url:
+            return
+        
+        cmd = ['katana', '-u', url, '-jc', '-silent', '-d', '2', '-timeout', '20']
+        output = ToolChecker.run_command(cmd, timeout=30)
+        
+        if output:
+            self._log_tool_status('katana', 'success')
+            
+            endpoints = set()
+            api_patterns = set()
+            
+            for line in output.split('\n'):
+                line = line.strip()
+                if line:
+                    endpoints.add(line)
+                    
+                    # Detect API patterns
+                    if '/api/' in line or '/v1/' in line or '/v2/' in line:
+                        api_patterns.add(line)
+            
+            for endpoint in list(endpoints)[:30]:
+                finding = Finding(endpoint, 'Katana', CONFIDENCE_LOW, 
+                                'endpoint', False, 'JS-extracted, not validated')
+                self._add_finding('application', finding)
+            
+            if api_patterns:
+                self.cache.update('application', 'api_patterns', list(api_patterns)[:20])
+        else:
+            self._log_tool_status('katana', 'failed')
+    
+    def _robots_sitemap(self):
+        """Robots.txt and sitemap analysis"""
+        if not ToolChecker.is_available('curl'):
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        base_url = f'https://{domain}'
+        
+        # Check robots.txt
+        output = ToolChecker.run_command(['curl', '-s', '-L', '--max-time', '10',
+                                         f'{base_url}/robots.txt'], timeout=15)
+        if output and 'disallow' in output.lower():
+            self._log_tool_status('robots.txt', 'found')
+            
+            paths = re.findall(r'(?:Disallow|Allow):\s*([^\s]+)', output, re.I)
+            for path in set(paths)[:20]:
+                if path != '/':
+                    finding = Finding(path, 'robots.txt', CONFIDENCE_MEDIUM, 
+                                    'path', False, 'Listed in robots.txt')
+                    self._add_finding('application', finding)
+        
+        # Check sitemap.xml
+        output = ToolChecker.run_command(['curl', '-s', '-L', '--max-time', '10',
+                                         f'{base_url}/sitemap.xml'], timeout=15)
+        if output and '<loc>' in output.lower():
+            self._log_tool_status('sitemap.xml', 'found')
+            
+            urls = re.findall(r'<loc>([^<]+)</loc>', output, re.I)
+            for url in set(urls)[:20]:
+                finding = Finding(url, 'sitemap.xml', CONFIDENCE_MEDIUM, 
+                                'url', False, 'Listed in sitemap')
+                self._add_finding('application', finding)
+    
+    # ============================================================
+    # MODULE 6: AUTHENTICATION & IDENTITY SURFACE
+    # ============================================================
+    
+    def authentication_surface(self):
+        """Authentication and identity surface mapping (passive)"""
+        print("\n[*] Running Authentication Surface Module...")
+        
+        self._detect_auth_patterns()
+        
+        print("[+] Authentication Surface complete")
+    
+    def _detect_auth_patterns(self):
+        """Detect authentication patterns from various sources"""
+        
+        # Analyze headers for auth hints
+        headers = self.cache.get('network', 'headers')
+        if headers:
+            auth_headers = ['www-authenticate', 'authorization', 
+                          'x-auth-token', 'access-control-allow-credentials']
+            for ah in auth_headers:
+                if ah in headers:
+                    finding = Finding(ah, 'HTTP Headers', CONFIDENCE_MEDIUM, 
+                                    'auth_mechanism', True)
+                    self._add_finding('authentication', finding)
+        
+        # Check for common OAuth/SSO endpoints from application findings
+        app_findings = self.findings.get('application', [])
+        oauth_patterns = ['/oauth/', '/auth/', '/login/', '/signin/', 
+                         '/sso/', '/.well-known/openid']
+        
+        for af in app_findings:
+            url = af.value.lower()
+            for pattern in oauth_patterns:
+                if pattern in url:
+                    finding = Finding(af.value, af.sources[0], CONFIDENCE_LOW,
+                                    'auth_endpoint', False, 'Pattern-based detection')
+                    self._add_finding('authentication', finding)
+                    break
+        
+        # Detect identity providers from JS or headers
+        idp_indicators = {
+            'google': ['accounts.google.com', 'googleapis.com/auth'],
+            'microsoft': ['login.microsoftonline.com', 'azure'],
+            'okta': ['okta.com'],
+            'auth0': ['auth0.com'],
+            'cognito': ['cognito']
+        }
+        
+        all_content = str(self.cache.data)
+        for provider, indicators in idp_indicators.items():
+            for indicator in indicators:
+                if indicator in all_content.lower():
+                    finding = Finding(provider.title(), 'Pattern Detection', 
+                                    CONFIDENCE_LOW, 'identity_provider', False)
+                    self._add_finding('authentication', finding)
+                    break
+    
+    # ============================================================
+    # MODULE 7: CLOUD & SAAS INTELLIGENCE
+    # ============================================================
+    
+    def cloud_intelligence(self):
+        """Cloud and SaaS exposure intelligence"""
+        print("\n[*] Running Cloud Intelligence Module...")
+        
+        self._detect_cloud_services()
+        
+        print("[+] Cloud Intelligence complete")
+    
+    def _detect_cloud_services(self):
+        """Detect cloud providers and services"""
+        
+        # Cloud provider detection from infrastructure
+        hosting = self.cache.get('infrastructure', 'hosting_provider')
+        if hosting:
+            cloud_providers = {
+                'aws': ['amazon', 'aws', 'ec2'],
+                'azure': ['microsoft', 'azure'],
+                'gcp': ['google', 'gcp', 'cloud'],
+                'digitalocean': ['digitalocean'],
+                'linode': ['linode'],
+                'vultr': ['vultr']
+            }
+            
+            hosting_lower = hosting.lower()
+            for provider, indicators in cloud_providers.items():
+                if any(ind in hosting_lower for ind in indicators):
+                    finding = Finding(provider.upper(), 'Infrastructure Analysis',
+                                    CONFIDENCE_HIGH, 'cloud_provider', True)
+                    self._add_finding('cloud', finding)
+                    self.cache.update('cloud', 'provider', provider.upper())
+                    break
+        
+        # Detect cloud storage patterns
+        storage_patterns = {
+            's3': [r's3\.amazonaws\.com', r's3-[\w-]+\.amazonaws\.com'],
+            'azure_blob': [r'\.blob\.core\.windows\.net'],
+            'gcs': [r'\.storage\.googleapis\.com'],
+            'cloudfront': [r'\.cloudfront\.net']
+        }
+        
+        all_findings = []
+        for category in self.findings.values():
+            all_findings.extend([f.value for f in category])
+        
+        all_text = ' '.join(all_findings)
+        
+        for storage_type, patterns in storage_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, all_text, re.I):
+                    finding = Finding(storage_type.replace('_', ' ').title(),
+                                    'Pattern Detection', CONFIDENCE_MEDIUM,
+                                    'cloud_storage', False)
+                    self._add_finding('cloud', finding)
+                    break
+        
+        # Detect CDN (already done in infrastructure, but add to cloud context)
+        cdn = self.cache.get('infrastructure', 'cdn')
+        if cdn:
+            finding = Finding(cdn, 'Infrastructure', CONFIDENCE_HIGH, 'cdn', True)
+            self._add_finding('cloud', finding)
+    
+    # ============================================================
+    # MODULE 8: HISTORICAL & METADATA ANALYSIS
+    # ============================================================
+    
+    def historical_analysis(self):
+        """Historical and metadata analysis"""
+        print("\n[*] Running Historical Analysis Module...")
+        
+        # Most historical data already collected in passive OSINT
+        self._analyze_metadata()
+        
+        print("[+] Historical Analysis complete")
+    
+    def _analyze_metadata(self):
+        """Analyze collected metadata"""
+        
+        # Summarize historical findings
+        wayback_count = self.cache.get('application', 'historical_url_count')
+        if wayback_count:
+            self.cache.update('historical', 'wayback_urls', wayback_count)
+        
+        extensions = self.cache.get('application', 'file_extensions')
+        if extensions:
+            self.cache.update('historical', 'file_extensions', extensions)
+        
+        params = self.cache.get('application', 'parameters')
+        if params:
+            self.cache.update('historical', 'parameters', params)
+    
+    # ============================================================
+    # MODULE 9: MISCONFIGURATION DISCOVERY
+    # ============================================================
+    
+    def misconfiguration_discovery(self):
+        """Validated misconfiguration discovery"""
+        print("\n[*] Running Misconfiguration Discovery Module...")
+        
+        self._validate_sensitive_paths()
+        
+        print("[+] Misconfiguration Discovery complete")
+    
+    def _validate_sensitive_paths(self):
+        """Validate potentially sensitive paths"""
+        if not ToolChecker.is_available('curl'):
+            return
+        
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return
+        
+        base_url = f'https://{domain}'
+        
+        # Common sensitive paths (conservative list)
+        sensitive_paths = [
+            '/.git/config',
+            '/.env',
+            '/backup.zip',
+            '/phpinfo.php',
+            '/.well-known/security.txt'
+        ]
+        
+        validated = []
+        potential = []
+        
+        for path in sensitive_paths:
+            url = base_url + path
+            cmd = ['curl', '-I', '-s', '-L', '--max-time', '5', url]
+            output = ToolChecker.run_command(cmd, timeout=8)
+            
+            if output:
+                # Check for 200 response
+                if 'HTTP/2 200' in output or 'HTTP/1.1 200' in output:
+                    validated.append(path)
+                    finding = Finding(path, 'Validation', CONFIDENCE_HIGH,
+                                    'exposed_path', True, 'Returns 200 OK')
+                    self._add_finding('misconfig', finding)
+                elif 'HTTP/2 403' in output or 'HTTP/1.1 403' in output:
+                    potential.append(path)
+                    finding = Finding(path, 'Validation', CONFIDENCE_LOW,
+                                    'potential_path', False, 'Returns 403 Forbidden')
+                    self._add_finding('misconfig', finding)
+            
+            time.sleep(0.5)  # Rate limiting
+        
+        if validated:
+            self.cache.update('misconfig', 'exposed_paths', validated)
+        if potential:
+            self.cache.update('misconfig', 'potential_paths', potential)
+        
+        # Check security.txt
+        url = f'{base_url}/.well-known/security.txt'
+        output = ToolChecker.run_command(['curl', '-s', '-L', '--max-time', '5', url], 
+                                        timeout=8)
+        if output and ('contact' in output.lower() or 'email' in output.lower()):
+            self.cache.update('misconfig', 'security_txt', 'Present')
+            finding = Finding('Security.txt present', 'Validation', CONFIDENCE_HIGH,
+                            'security_contact', True)
+            self._add_finding('misconfig', finding)
+    
+    # ============================================================
+    # MODULE 10: CORRELATION & CONFIDENCE SCORING
+    # ============================================================
+    
+    def correlation_engine(self):
+        """Correlate findings and calculate confidence scores"""
+        print("\n[*] Running Correlation Engine...")
+        
+        self._cross_validate_findings()
+        self._generate_confidence_summary()
+        
+        print("[+] Correlation complete")
+    
+    def _cross_validate_findings(self):
+        """Cross-validate findings across modules"""
+        
+        # Technology validation
+        tech_findings = self.findings.get('technology', [])
+        header_tech = self.cache.get('technology', 'from_headers')
+        
+        for finding in tech_findings:
+            if header_tech:
+                for tech in header_tech.values():
+                    if tech.lower() in finding.value.lower():
+                        finding.validated = True
+                        finding.confidence = CONFIDENCE_HIGH
+        
+        # Infrastructure correlation
+        cdn = self.cache.get('infrastructure', 'cdn')
+        origin_hidden = self.cache.get('infrastructure', 'origin_ip_hidden')
+        
+        if cdn and origin_hidden:
+            self.cache.update('correlation', 'cdn_note',
+                            f'{cdn} detected - origin IP likely hidden behind CDN')
+    
+    def _generate_confidence_summary(self):
+        """Generate confidence summary for all findings"""
+        
+        summary = {
+            'high_confidence': 0,
+            'medium_confidence': 0,
+            'low_confidence': 0,
+            'validated': 0,
+            'unvalidated': 0
+        }
+        
+        for category in self.findings.values():
+            for finding in category:
+                if finding.confidence == CONFIDENCE_HIGH:
+                    summary['high_confidence'] += 1
+                elif finding.confidence == CONFIDENCE_MEDIUM:
+                    summary['medium_confidence'] += 1
+                else:
+                    summary['low_confidence'] += 1
+                
+                if finding.validated:
+                    summary['validated'] += 1
+                else:
+                    summary['unvalidated'] += 1
+        
+        self.cache.update('correlation', 'summary', summary)
+    
+    # ============================================================
+    # MODULE 11: REPORT GENERATION
+    # ============================================================
+    
+    def generate_report(self):
+        """Generate final markdown report"""
+        print("\n[*] Generating Final Report...")
+        
+        target = self.cache.get('target', 'primary')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{CONFIG['report_dir']}/recon_{target.replace('.', '_')}_{timestamp}.md"
+        
+        report = self._build_report_content()
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(report)
+            print(f"[+] Report saved to: {filename}")
+            return filename
+        except Exception as e:
+            print(f"[!] Failed to save report: {e}")
+            print("\n" + "="*60)
+            print(report)
+            print("="*60)
+            return None
+    
+    def _build_report_content(self) -> str:
+        """Build the complete report content"""
+        
+        target = self.cache.get('target', 'primary')
+        target_type = self.cache.get('target', 'type')
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        report = f"""# Black-Box Intelligence Report
+## {target}
+
+**Report Generated:** {timestamp}  
+**Target Type:** {target_type.upper()}  
+**Framework Version:** 1.0.0
+
+---
+
+## Executive Summary
+
+This report contains validated intelligence gathered through passive reconnaissance and safe active probing. All findings are classified by confidence level and validation status.
+
+"""
+        
+        # Confidence Summary
+        summary = self.cache.get('correlation', 'summary')
+        if summary:
+            report += f"""### Confidence Summary
+
+- **High Confidence Findings:** {summary.get('high_confidence', 0)}
+- **Medium Confidence Findings:** {summary.get('medium_confidence', 0)}
+- **Low Confidence Findings:** {summary.get('low_confidence', 0)}
+- **Validated Findings:** {summary.get('validated', 0)}
+- **Unvalidated Findings:** {summary.get('unvalidated', 0)}
+
+---
+
+"""
+        
+        # Infrastructure Intelligence
+        report += "## 1. Infrastructure & Network Intelligence\n\n"
+        
+        infra_data = self._format_infrastructure_section()
+        if infra_data:
+            report += infra_data
+        else:
+            report += "*No infrastructure data could be reliably determined.*\n\n"
+        
+        # Technology Stack
+        report += "## 2. Technology Stack\n\n"
+        
+        tech_data = self._format_technology_section()
+        if tech_data:
+            report += tech_data
+        else:
+            report += "*Technology stack could not be reliably identified.*\n\n"
+        
+        # Application Surface
+        report += "## 3. Application Surface Intelligence\n\n"
+        
+        app_data = self._format_application_section()
+        if app_data:
+            report += app_data
+        else:
+            report += "*No significant application surface data collected.*\n\n"
+        
+        # Authentication Surface
+        report += "## 4. Authentication & Identity Surface\n\n"
+        
+        auth_data = self._format_authentication_section()
+        if auth_data:
+            report += auth_data
+        else:
+            report += "*No authentication mechanisms detected.*\n\n"
+        
+        # Cloud & SaaS
+        report += "## 5. Cloud & SaaS Intelligence\n\n"
+        
+        cloud_data = self._format_cloud_section()
+        if cloud_data:
+            report += cloud_data
+        else:
+            report += "*No cloud or SaaS services detected.*\n\n"
+        
+        # OSINT Highlights
+        report += "## 6. OSINT Highlights\n\n"
+        
+        osint_data = self._format_osint_section()
+        if osint_data:
+            report += osint_data
+        else:
+            report += "*No significant OSINT data collected.*\n\n"
+        
+        # Misconfigurations
+        report += "## 7. Validated Misconfigurations\n\n"
+        
+        misconfig_data = self._format_misconfig_section()
+        if misconfig_data:
+            report += misconfig_data
+        else:
+            report += "*No confirmed misconfigurations detected.*\n\n"
+        
+        # Attack Surface Summary
+        report += "## 8. Attack Surface Summary\n\n"
+        report += self._format_attack_surface()
+        
+        # Manual Verification Checklist
+        report += "\n## 9. Manual Verification Checklist\n\n"
+        report += self._generate_verification_checklist()
+        
+        # Tool Execution Summary
+        report += "\n## 10. Tool Execution Summary\n\n"
+        report += self._format_tool_status()
+        
+        # Google Dorking Templates
+        report += "\n## 11. Recommended Google Dorks\n\n"
+        report += self._generate_google_dorks()
+        
+        report += "\n---\n\n"
+        report += "*This report contains only validated or clearly marked unvalidated findings. *\n"
+        report += "*Empty sections indicate lack of reliable data, not absence of the feature.*\n"
+        
+        return report
+    
+    def _format_infrastructure_section(self) -> str:
+        """Format infrastructure section"""
+        section = ""
+        
+        # Primary IP
+        primary_ip = self.cache.get('infrastructure', 'primary_ip')
+        if primary_ip:
+            section += f"**Primary IP Address:** `{primary_ip}`\n\n"
+        
+        # ASN & Hosting
+        asn = self.cache.get('infrastructure', 'asn')
+        provider = self.cache.get('infrastructure', 'hosting_provider')
+        if asn or provider:
+            section += "**Network Information:**\n"
+            if asn:
+                section += f"- ASN: `{asn}`\n"
+            if provider:
+                section += f"- Hosting Provider: {provider}\n"
+            section += "\n"
+        
+        # CDN Detection
+        cdn = self.cache.get('infrastructure', 'cdn')
+        origin_hidden = self.cache.get('infrastructure', 'origin_ip_hidden')
+        if cdn:
+            section += f"**CDN Detected:** {cdn}\n"
+            if origin_hidden:
+                section += "*Note: Origin IP is likely hidden behind CDN*\n"
+            section += "\n"
+        
+        # PTR Record
+        ptr = self.cache.get('infrastructure', 'ptr_record')
+        if ptr:
+            section += f"**Reverse DNS (PTR):** `{ptr}`\n\n"
+        
+        # Subdomains
+        subdomain_findings = [f for f in self.findings.get('infrastructure', [])
+                             if f.category == 'subdomain']
+        if subdomain_findings:
+            section += f"**Subdomains Found:** {len(subdomain_findings)}\n"
+            section += "*Source: Certificate Transparency logs (not validated)*\n\n"
+        
+        # TLS Information
+        tls_version = self.cache.get('network', 'tls_version')
+        tls_issuer = self.cache.get('network', 'tls_issuer')
+        if tls_version or tls_issuer:
+            section += "**TLS/SSL Information:**\n"
+            if tls_version:
+                section += f"- TLS Version: {tls_version}\n"
+            if tls_issuer:
+                section += f"- Certificate Issuer: {tls_issuer}\n"
+            section += "\n"
+        
+        # HTTP Version
+        http_version = self.cache.get('network', 'http_version')
+        if http_version:
+            section += f"**HTTP Protocol:** {http_version}\n\n"
+        
+        # Security Headers
+        sec_headers = self.cache.get('network', 'security_headers')
+        if sec_headers:
+            section += "**Security Headers Detected:**\n"
+            for header in sec_headers:
+                section += f"- {header}\n"
+            section += "\n"
+        
+        return section
+    
+    def _format_technology_section(self) -> str:
+        """Format technology section"""
+        section = ""
+        
+        validated_tech = self.cache.get('technology', 'validated')
+        if validated_tech:
+            # Group by category
+            by_category = defaultdict(list)
+            for tech in validated_tech:
+                by_category[tech['category']].append(tech)
+            
+            for category, techs in by_category.items():
+                section += f"**{category.title()}:**\n"
+                for tech in techs:
+                    sources = ', '.join(tech['sources'])
+                    section += f"- {tech['value']} "
+                    section += f"(Confidence: {tech['confidence']}, Sources: {sources})\n"
+                section += "\n"
+        
+        # Add header-based technology
+        from_headers = self.cache.get('technology', 'from_headers')
+        if from_headers and not validated_tech:
+            section += "**Detected from Headers:**\n"
+            for category, value in from_headers.items():
+                section += f"- {category.title()}: {value}\n"
+            section += "\n"
+        
+        return section
+    
+    def _format_application_section(self) -> str:
+        """Format application section"""
+        section = ""
+        
+        # Historical URLs
+        url_count = self.cache.get('application', 'historical_url_count')
+        if url_count:
+            section += f"**Historical URLs:** {url_count} found via Wayback Machine\n\n"
+        
+        # File Extensions
+        extensions = self.cache.get('application', 'file_extensions')
+        if extensions:
+            section += "**File Extensions Observed:**\n"
+            section += f"`{', '.join(extensions[:20])}`\n\n"
+        
+        # Parameters
+        params = self.cache.get('application', 'parameters')
+        if params:
+            section += "**Parameter Names Observed:**\n"
+            section += f"`{', '.join(params[:20])}`\n\n"
+        
+        # API Patterns
+        api_patterns = self.cache.get('application', 'api_patterns')
+        if api_patterns:
+            section += "**Potential API Endpoints:**\n"
+            for pattern in api_patterns[:10]:
+                section += f"- `{pattern}` (Not validated)\n"
+            section += "\n"
+        
+        # Endpoints from robots/sitemap
+        robots_paths = [f for f in self.findings.get('application', [])
+                       if f.sources[0] in ['robots.txt', 'sitemap.xml']]
+        if robots_paths:
+            section += "**Paths from robots.txt/sitemap.xml:**\n"
+            for finding in robots_paths[:15]:
+                section += f"- `{finding.value}` ({finding.sources[0]})\n"
+            section += "\n"
+        
+        return section
+    
+    def _format_authentication_section(self) -> str:
+        """Format authentication section"""
+        section = ""
+        
+        auth_findings = self.findings.get('authentication', [])
+        if auth_findings:
+            # Group by category
+            by_category = defaultdict(list)
+            for finding in auth_findings:
+                by_category[finding.category].append(finding)
+            
+            for category, findings in by_category.items():
+                section += f"**{category.replace('_', ' ').title()}:**\n"
+                for finding in findings:
+                    conf_marker = "✓" if finding.confidence == CONFIDENCE_HIGH else "?"
+                    section += f"- [{conf_marker}] {finding.value} "
+                    if finding.notes:
+                        section += f"({finding.notes})"
+                    section += "\n"
+                section += "\n"
+        
+        return section
+    
+    def _format_cloud_section(self) -> str:
+        """Format cloud section"""
+        section = ""
+        
+        # Cloud Provider
+        provider = self.cache.get('cloud', 'provider')
+        if provider:
+            section += f"**Cloud Provider:** {provider}\n\n"
+        
+        # Cloud findings
+        cloud_findings = self.findings.get('cloud', [])
+        if cloud_findings:
+            by_category = defaultdict(list)
+            for finding in cloud_findings:
+                by_category[finding.category].append(finding)
+            
+            for category, findings in by_category.items():
+                if category != 'cloud_provider':  # Already shown above
+                    section += f"**{category.replace('_', ' ').title()}:**\n"
+                    for finding in findings:
+                        validated = "✓" if finding.validated else "?"
+                        section += f"- [{validated}] {finding.value}\n"
+                    section += "\n"
+        
+        return section
+    
+    def _format_osint_section(self) -> str:
+        """Format OSINT section"""
+        section = ""
+        
+        # Organization
+        org = self.cache.get('infrastructure', 'organization')
+        if org:
+            section += f"**Organization:** {org}\n\n"
+        
+        # Registrar
+        registrar = self.cache.get('osint', 'registrar')
+        if registrar:
+            section += f"**Domain Registrar:** {registrar}\n\n"
+        
+        # Emails
+        email_findings = [f for f in self.findings.get('osint', [])
+                         if f.category == 'email']
+        if email_findings:
+            section += "**Email Addresses:**\n"
+            for finding in email_findings[:10]:
+                sources = ', '.join(finding.sources)
+                section += f"- {finding.value} (Sources: {sources})\n"
+            section += "\n"
+        
+        return section
+    
+    def _format_misconfig_section(self) -> str:
+        """Format misconfiguration section"""
+        section = ""
+        
+        # Exposed paths
+        exposed = self.cache.get('misconfig', 'exposed_paths')
+        if exposed:
+            section += "**⚠ Exposed Paths (Confirmed):**\n"
+            for path in exposed:
+                section += f"- `{path}` (Returns 200 OK)\n"
+            section += "\n"
+        
+        # Potential paths
+        potential = self.cache.get('misconfig', 'potential_paths')
+        if potential:
+            section += "**Potential Sensitive Paths (403 Forbidden):**\n"
+            for path in potential:
+                section += f"- `{path}` (Not confirmed exposed)\n"
+            section += "\n"
+        
+        # Security.txt
+        sec_txt = self.cache.get('misconfig', 'security_txt')
+        if sec_txt:
+            section += "**Security Contact:** `/.well-known/security.txt` present\n\n"
+        
+        return section
+    
+    def _format_attack_surface(self) -> str:
+        """Format attack surface summary"""
+        section = "**Key Attack Surface Areas:**\n\n"
+        
+        surface_points = []
+        
+        # Web application
+        if self.cache.get('target', 'domain'):
+            surface_points.append("- Web application accessible")
+        
+        # Exposed IPs
+        if self.cache.get('infrastructure', 'primary_ip'):
+            ip_exposed = not self.cache.get('infrastructure', 'origin_ip_hidden')
+            if ip_exposed:
+                surface_points.append("- Origin IP directly accessible (not behind CDN)")
+        
+        # Technology stack
+        tech = self.cache.get('technology', 'validated')
+        if tech:
+            surface_points.append(f"- {len(tech)} technologies identified")
+        
+        # Application endpoints
+        app_findings = self.findings.get('application', [])
+        if app_findings:
+            surface_points.append(f"- {len(app_findings)} application endpoints/paths discovered")
+        
+        # Authentication
+        auth_findings = self.findings.get('authentication', [])
+        if auth_findings:
+            surface_points.append(f"- {len(auth_findings)} authentication-related findings")
+        
+        # Misconfigurations
+        exposed_paths = self.cache.get('misconfig', 'exposed_paths')
+        if exposed_paths:
+            surface_points.append(f"- ⚠ {len(exposed_paths)} confirmed exposed sensitive paths")
+        
+        if surface_points:
+            section += '\n'.join(surface_points)
+        else:
+            section += "*Limited attack surface data collected.*"
+        
+        section += "\n\n**Note:** This is a high-level summary. Refer to detailed sections above for complete findings.\n"
+        
+        return section
+    
+    def _generate_verification_checklist(self) -> str:
+        """Generate manual verification checklist"""
+        checklist = """**Recommended Manual Verification Steps:**
+
+1. **Infrastructure Validation:**
+   - Verify actual origin IP if CDN detected
+   - Check for additional subdomains via manual DNS queries
+   - Validate hosting provider information
+
+2. **Technology Stack Verification:**
+   - Manually inspect page source for framework signatures
+   - Verify detected technologies via browser dev tools
+   - Check for version-specific vulnerabilities
+3. **Application Surface Testing:**
+   - Manually browse discovered endpoints
+   - Test API endpoints for proper authentication
+   - Verify parameter handling and input validation
+
+4. **Authentication Testing:**
+   - Test login mechanisms manually
+   - Verify OAuth/SSO implementations
+   - Check for account enumeration vulnerabilities
+
+5. **Misconfiguration Validation:**
+   - Manually verify exposed paths
+   - Check for information disclosure in error messages
+   - Test for directory listing vulnerabilities
+
+6. **Cloud Security Review:**
+   - Verify cloud storage bucket permissions
+   - Check for exposed cloud services
+   - Review CDN configuration
+
+7. **OSINT Follow-up:**
+   - Investigate identified email addresses
+   - Research organization structure
+   - Check for leaked credentials in breach databases
+
+"""
+        return checklist
+    
+    def _format_tool_status(self) -> str:
+        """Format tool execution status"""
+        section = ""
+        
+        tools = self.cache.data.get('tool_status', {}).get('tools', {})
+        if tools:
+            section += "| Tool | Status |\n"
+            section += "|------|--------|\n"
+            
+            for tool, status in sorted(tools.items()):
+                emoji = "✅" if status == "success" else "❌" if status == "failed" else "⚠️"
+                section += f"| {tool} | {emoji} {status} |\n"
+            
+            section += "\n"
+        else:
+            section += "*No tool execution data recorded.*\n"
+        
+        return section
+    
+    def _generate_google_dorks(self) -> str:
+        """Generate Google dork templates"""
+        domain = self.cache.get('target', 'domain')
+        if not domain:
+            return "*No domain available for dork generation.*\n"
+        
+        dorks = f"""**Recommended Google Dorks for {domain}:**
+```
+# File exposure
+site:{domain} ext:sql | ext:db | ext:log | ext:bak
+site:{domain} ext:xml | ext:conf | ext:cnf | ext:reg | ext:inf
+site:{domain} ext:env | ext:properties | ext:yml
+
+# Directory listing
+site:{domain} intitle:"index of"
+
+# Login pages
+site:{domain} inurl:login | inurl:signin | inurl:admin
+
+# Error messages
+site:{domain} intext:"sql syntax" | intext:"mysql error"
+site:{domain} intext:"warning" | intext:"error"
+
+# Parameter discovery
+site:{domain} inurl:? | inurl:& | inurl:=
+
+# Subdomains
+site:*.{domain} -www
+
+# Documents
+site:{domain} filetype:pdf | filetype:doc | filetype:xls
+
+# Cloud storage
+site:{domain} inurl:s3.amazonaws.com | inurl:blob.core.windows.net
+
+# API endpoints
+site:{domain} inurl:api | inurl:v1 | inurl:v2 | inurl:rest
+
+# Configuration files
+site:{domain} inurl:config | inurl:settings | inurl:env
+```
+
+**Note:** Use these responsibly and in accordance with the target's bug bounty program or authorization scope.
+
+"""
+        return dorks
+    
+    # ============================================================
+    # MAIN EXECUTION FLOW
+    # ============================================================
+    
+    def run(self):
+        """Execute full reconnaissance workflow"""
+        print("="*60)
+        print("Black-Box Intelligence & Attack-Surface Mapping")
+        print("="*60)
+        print(f"\nTarget: {self.target}")
+        print(f"Scan started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("\n" + "="*60)
+        
+        try:
+            # Execute modules sequentially
+            self.passive_osint()
+            self.infrastructure_intelligence()
+            self.network_intelligence()
+            self.technology_stack()
+            self.application_surface()
+            self.authentication_surface()
+            self.cloud_intelligence()
+            self.historical_analysis()
+            self.misconfiguration_discovery()
+            self.correlation_engine()
+            
+            # Generate report
+            report_path = self.generate_report()
+            
+            print("\n" + "="*60)
+            print("Reconnaissance Complete!")
+            print("="*60)
+            
+            if report_path:
+                print(f"\n✓ Report saved: {report_path}")
+            
+            # Print quick summary
+            self._print_summary()
+            
+        except KeyboardInterrupt:
+            print("\n\n[!] Scan interrupted by user")
+            print("[*] Generating partial report...")
+            self.generate_report()
+        except Exception as e:
+            print(f"\n[!] Error during execution: {e}")
+            print("[*] Generating partial report...")
+            self.generate_report()
+    
+    def _print_summary(self):
+        """Print quick summary to console"""
+        print("\n" + "-"*60)
+        print("QUICK SUMMARY")
+        print("-"*60)
+        
+        summary = self.cache.get('correlation', 'summary')
+        if summary:
+            print(f"\nFindings Summary:")
+            print(f"  • High Confidence: {summary.get('high_confidence', 0)}")
+            print(f"  • Medium Confidence: {summary.get('medium_confidence', 0)}")
+            print(f"  • Low Confidence: {summary.get('low_confidence', 0)}")
+            print(f"  • Validated: {summary.get('validated', 0)}")
+        
+        # Key findings
+        primary_ip = self.cache.get('infrastructure', 'primary_ip')
+        if primary_ip:
+            print(f"\n  • Primary IP: {primary_ip}")
+        
+        provider = self.cache.get('infrastructure', 'hosting_provider')
+        if provider:
+            print(f"  • Hosting: {provider}")
+        
+        cdn = self.cache.get('infrastructure', 'cdn')
+        if cdn:
+            print(f"  • CDN: {cdn}")
+        
+        tech_count = len(self.cache.get('technology', 'validated') or [])
+        if tech_count:
+            print(f"  • Technologies: {tech_count} identified")
+        
+        exposed_paths = self.cache.get('misconfig', 'exposed_paths')
+        if exposed_paths:
+            print(f"\n  ⚠ WARNING: {len(exposed_paths)} exposed sensitive paths found!")
+        
+        print("\n" + "-"*60)
+
+
+def print_banner():
+    """Print tool banner"""
+    banner = """
+╔═══════════════════════════════════════════════════════════╗
+║   Attack-Surface Mapping Tool                             ║
+║   Author :Shivam Kumar                                    ║
+║   Version 1.0.0                                           ║
+╚═══════════════════════════════════════════════════════════╝
+"""
+    print(banner)
+
+
+def print_usage():
+    """Print usage information"""
+    usage = """
+Usage: infogather <target>
+
+Target formats:
+  - Domain:     example.com
+  - URL:        https://example.com
+  - IP Address: 192.168.1.1
+  - ASN:        AS12345
+
+Examples:
+  infogather example.com
+  infogather https://api.example.com
+  infogather 192.168.1.1
+  infogather AS12345
+
+Features:
+  ✓ Passive OSINT collection
+  ✓ Infrastructure intelligence
+  ✓ Technology stack identification
+  ✓ Application surface mapping
+  ✓ Authentication surface analysis
+  ✓ Cloud & SaaS detection
+  ✓ Misconfiguration discovery
+  ✓ Confidence scoring & validation
+  ✓ Comprehensive markdown reports
+
+Requirements:
+  Parrot OS Linux or Kali Linux recommended
+  Common tools: whois, dig, curl, openssl, etc.
+  Optional: theHarvester, whatweb, katana
+
+Note: This tool performs only passive and safe reconnaissance.
+      Always ensure you have proper authorization.
+"""
+    print(usage)
+
+
+def check_prerequisites():
+    """Check for critical prerequisites"""
+    critical_tools = ['whois', 'dig', 'curl']
+    missing = []
+    
+    for tool in critical_tools:
+        if not ToolChecker.is_available(tool):
+            missing.append(tool)
+    
+    if missing:
+        print(f"[!] Warning: Critical tools missing: {', '.join(missing)}")
+        print("[!] Some modules may not function properly")
+        print("[!] Install with: sudo apt install " + ' '.join(missing))
+        
+        response = input("\nContinue anyway? (y/N): ")
+        if response.lower() != 'y':
+            sys.exit(1)
+
+
+def main():
+    """Main entry point"""
+    print_banner()
+    
+    # Parse arguments
+    if len(sys.argv) != 2:
+        print_usage()
+        sys.exit(1)
+    
+    target = sys.argv[1]
+    
+    if target in ['-h', '--help', 'help']:
+        print_usage()
+        sys.exit(0)
+    
+    # Check prerequisites
+    check_prerequisites()
+    
+    # Run reconnaissance
+    try:
+        framework = ReconFramework(target)
+        framework.run()
+    except Exception as e:
+        print(f"\n[!] Fatal error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
